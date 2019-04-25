@@ -1,0 +1,249 @@
+---
+title: "Stan Regularized Linear Models"
+author: "Michael Rose"
+date: "4/23/2019"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(rstanarm)
+options(mc.cores = parallel::detectCores())
+library(tidyverse)
+library(magrittr)
+library(furrr)
+plan(multiprocess)
+```
+
+# Introduction
+
+In this document we will estimate a linear model using the STAN Bayesian modeling engine. 
+
+The four steps to a Bayesian analysis are the following: 
+
+- 1. Specify a joint distribution for the outcome and all the unknowns. This takes the form of a marginal prior distribution for the unknowns multiplied by a likelihood for the outcomes conditional on the unknowns. Our joint distribution is proportional to a posterior distribution of the unknowns conditioned on the observed data. 
+
+- 2. Draw from our posterior with Markov Chain Monte Carlo sampling 
+
+- 3. Evaluate how well the model fits the data and revise if necessary
+
+- 4. Draw from the posterior predictive distribution of the outcomes given interesting values of the predictors in order to visualize how manipulations in the predictors affect the outcomes. 
+
+# The Data
+
+?msleep
+
+```{r}
+msleep %>% head()
+```
+
+```{r}
+# remove NA 
+msleep %>% 
+  ggplot(aes(brainwt, sleep_total)) + 
+  geom_point()
+```
+
+This doesn't look too good. Lets try a transformation
+
+```{r}
+# transform
+msleep %<>%
+  filter(!(is.na(brainwt))) %>% 
+  mutate(log_brainwt = brainwt %>% log10(), 
+         log_bodyweight = bodywt %>% log10(), 
+         log_sleep_total = sleep_total %>% log10())
+
+# plot 
+msleep %>% 
+  ggplot(aes(log_brainwt, sleep_total)) + 
+  geom_point()
+```
+
+This looks much better. Lets see if we can get a better idea of what is going on here.
+
+```{r}
+# choose species to highlight
+species <- c("Goat", "Horse", "Dog", "Human", "Jaguar", "Chinchilla", "Pig", "Tenrec")
+
+# make df of chosen animals
+species_df <- msleep %>% 
+  filter(name %in% species)
+
+# plot 
+msleep %>% 
+  ggplot(aes(log_brainwt, sleep_total)) + 
+  geom_point() + 
+  geom_point(size = 3, shape = 1, color = "blue", data = species_df) + 
+  ggrepel::geom_text_repel(aes(label = name), data = species_df) + 
+  xlab(paste0("Brain Weight (", expression(log10), " kg)")) + 
+  ylab("Sleep Total")
+
+```
+
+# Classical Regression
+
+```{r}
+# fit model
+lm_classical <- lm(log_sleep_total ~ log_brainwt, data = msleep)
+
+# check summary
+summary(lm_classical)
+
+# grab coefficients
+coef(lm_classical)
+```
+
+```{r}
+msleep %>% 
+  ggplot(aes(log_brainwt, log_sleep_total)) + 
+  geom_point() + 
+  stat_smooth(method = "lm", level = 0.95) + 
+  scale_x_continuous(labels = function(x) {10^x}) + 
+  xlab(paste0("Brain Weight (", expression(log10), " kg)")) + 
+  ylab(paste0("Sleep Total (", expression(log10), " hours)"))
+
+```
+
+# Multiple Plausible Regression Lines
+
+```{r}
+# fit models
+many_lines_model <- stan_glm(
+  log_sleep_total ~ log_brainwt, 
+  family = gaussian(), 
+  data = msleep, 
+  prior = normal(0, 3), 
+  prior_intercept = normal(0, 3)
+)
+
+# check summary
+summary(many_lines_model)
+
+# check median parameter estimates
+coef(many_lines_model)
+```
+
+```{r}
+# sample the posterior and place each model into a dataframe
+model_fits <- many_lines_model %>% 
+  as_tibble() %>% 
+  rename(intercept = "(Intercept)")
+
+# look at data frame
+model_fits %>% head()
+```
+
+```{r}
+# sample lines 
+n_draws <- 500
+alpha_level <- 0.15
+col_draw <- "grey60"
+col_median <- "#3366FF"
+
+msleep %>% 
+  ggplot(aes(log_brainwt, log_sleep_total)) + 
+  # plot sample of linear models 
+              data = sample_n(model_fits, n_draws), color = col_draw, alpha = alpha_level) + 
+  geom_abline(aes(intercept = intercept, slope = log_brainwt), 
+  # plot median values 
+  geom_abline(intercept = model_fits$intercept %>% median(), 
+              slope = model_fits$log_brainwt %>% median(), 
+              size = 1, color = col_median) + 
+  geom_point() + 
+  scale_x_continuous(labels = function(x) {10^x}) + 
+  xlab(paste0("Brain Weight (", expression(log10), " kg)")) + 
+  ylab(paste0("Sleep Total (", expression(log10), " hours)"))
+```
+
+# Mean and 95% Confidence Interval
+
+We can also draw a line of best fit and the 95% uncertainty interval around it. 
+
+```{r}
+# get log_brainwt range
+x_range <- range(msleep$log_brainwt)
+
+# break the range into 80 steps
+x_steps <- seq(x_range[1], x_range[2], length.out = 80)
+
+# simulate data 
+sim_data <- tibble(
+  observation = seq_along(x_steps), 
+  log_brainwt = x_steps
+)
+
+```
+
+The function `posterior_linpred` returns the means of a model fitted on a data frame of new data. 
+
+```{r}
+pred_lin_models <- posterior_linpred(many_lines_model, newdata = sim_data)
+
+pred_lin_models %>% dim()
+```
+
+We now have 80 different fitted means for each of the 4000 samples from the posterior. We wish to reduce this to a median with a 95% interval around each point. 
+
+```{r}
+get_preds <- function(mean_preds, new_data, obs_name = "observation", prob_lower = 0.025, prob_upper = 0.975){
+  # make dataframe with one row per fitted value per posterior sample
+  df_prediction <- mean_preds %>%
+    as_tibble() %>% 
+    setNames(seq_len(ncol(.))) %>% 
+    rownames_to_column("posterior_sample") %>% 
+    gather_(obs_name, "fitted", setdiff(names(.), "posterior_sample"))
+  
+  # set class equal to df data 
+  class(df_prediction[[obs_name]]) <- class(new_data[[obs_name]])
+  
+  # summarize prediction interval for each observation
+  df_prediction %>% 
+    group_by_(obs_name) %>% 
+    summarize(median = median(fitted), 
+              lower = quantile(fitted, prob_lower),
+              upper = quantile(fitted, prob_upper)) %>% 
+    left_join(new_data, by = obs_name)
+}
+
+df_pred_lin <- get_preds(pred_lin_models, sim_data)
+
+# plot 
+
+msleep %>% 
+  ggplot(aes(log_brainwt)) + 
+  geom_ribbon(aes(ymin = lower, ymax = upper), data = df_pred_lin,
+              alpha = 0.4, fill = "grey60") + 
+  geom_line(aes(y = median), data = df_pred_lin, color = "#3366FF", size = 1) + 
+  geom_point(aes(y = log_sleep_total)) + 
+  scale_x_continuous(labels = function(x) {10^x}) + 
+  xlab(paste0("Brain Weight (", expression(log10), " kg)")) + 
+  ylab(paste0("Sleep Total (", expression(log10), " hours)"))
+```
+
+# Mean and 95% Interval for Model Generated Data
+
+Instead of using `posterior_linpred`, it would be preferable to use `posterior_predict` since it uses more information from the model, namely the error sigma. 
+
+```{r}
+# generate matrix with 1 row per posterior draw and one column per observation
+pred_post <- posterior_predict(many_lines_model, newdata = sim_data)
+
+df_pred_post <- get_preds(pred_post, sim_data)
+
+```
+
+```{r}
+# plot 
+msleep %>% 
+  ggplot(aes(x = log_brainwt)) + 
+  geom_ribbon(aes(ymin = lower, ymax = upper), data = df_pred_post, 
+              alpha = 0.4, fill = "grey60") + 
+  geom_line(aes(y = median), data = df_pred_post, color = "#3366FF", size = 1) + 
+  geom_point(aes(y = log_sleep_total)) + 
+  scale_x_continuous(labels = function(x) {10^x}) + 
+  xlab(paste0("Brain Weight (", expression(log10), " kg)")) + 
+  ylab(paste0("Sleep Total (", expression(log10), " hours)"))
+```
